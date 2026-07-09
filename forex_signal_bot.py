@@ -40,10 +40,10 @@ TWELVE_DATA_API_KEY = os.environ.get("TWELVE_DATA_API_KEY", "YOUR_TWELVE_DATA_KE
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "YOUR_CHAT_ID")
 
-PAIRS = ["EUR/USD", "GBP/USD", "USD/JPY", "AUD/USD"]  # edit to your majors
-INTERVAL = "1h"          # Twelve Data format: 1min,5min,15min,1h,4h,1day...
+PAIRS = ["EUR/USD", "GBP/USD", "USD/JPY", "AUD/USD", "XAU/USD"]  # edit to your majors
+INTERVAL = "15min"       # Twelve Data format: 1min,5min,15min,1h,4h,1day...
 CANDLE_COUNT = 100       # how many candles to pull per check
-POLL_SECONDS = 300       # how often to check (5 min). Align to your candle close in production.
+POLL_SECONDS = 900       # how often to check (15 min), aligned with candle close.
 
 # Detection tuning (see smc_detection.py for what these mean)
 SWING_LOOKBACK = 3
