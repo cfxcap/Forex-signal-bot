@@ -60,6 +60,11 @@ HTF_TIMEFRAMES = ["2h", "4h"]     # "higher timeframe" zones to watch
 HTF_REFRESH_HOURS = 2            # only re-fetch HTF candles this often (rate-limit friendly)
 HTF_CANDLE_COUNT = 100
 
+# Twelve Data free tier allows 8 requests/minute. This delay spaces out
+# calls so a run with many fetches (main pairs + HTF refresh) doesn't
+# fire them all in the same second and trip the per-minute limit.
+RATE_LIMIT_DELAY_SECONDS = 8
+
 # Detection tuning (see smc_detection.py for what these mean)
 SWING_LOOKBACK = 3
 FVG_MIN_GAP_PCT = 0.0005
@@ -104,6 +109,8 @@ def fetch_candles(pair: str, interval: str, count: int) -> list:
     }
     resp = requests.get(url, params=params, timeout=15)
     data = resp.json()
+
+    time.sleep(RATE_LIMIT_DELAY_SECONDS)  # stay under the 8 req/min free-tier limit
 
     if "values" not in data:
         raise RuntimeError(f"Twelve Data error for {pair}: {data}")
