@@ -194,6 +194,21 @@ def find_order_blocks(candles: List[dict], impulse_move_pct: float = 0.003) -> L
     return obs
 
 
+def check_price_in_zones(price: float, obs: List[OrderBlock], lookback: int = 15) -> Optional[OrderBlock]:
+    """
+    Checks if `price` currently sits inside any of the most recent
+    order blocks (used for higher-timeframe supply/demand zone alerts).
+
+    lookback: only consider the most recent N order blocks, so we don't
+    keep re-alerting on zones from weeks ago that price happens to revisit.
+    """
+    recent_obs = obs[-lookback:] if len(obs) > lookback else obs
+    for ob in reversed(recent_obs):  # most recent first
+        if ob.bottom <= price <= ob.top:
+            return ob
+    return None
+
+
 # ---------------------------------------------------------------------
 # 5. Combine into an entry signal
 # ---------------------------------------------------------------------
