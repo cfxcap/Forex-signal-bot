@@ -113,9 +113,12 @@ def fetch_candles(pair: str, interval: str, count: int) -> list:
         "apikey": TWELVE_DATA_API_KEY,
     }
     resp = requests.get(url, params=params, timeout=15)
-    data = resp.json()
+    time.sleep(RATE_LIMIT_DELAY_SECONDS)  # always throttle, even if this call failed
 
-    time.sleep(RATE_LIMIT_DELAY_SECONDS)  # stay under the 8 req/min free-tier limit
+    try:
+        data = resp.json()
+    except ValueError:
+        raise RuntimeError(f"Twelve Data returned a non-JSON response for {pair} (likely rate-limited): {resp.text[:200]}")
 
     if "values" not in data:
         raise RuntimeError(f"Twelve Data error for {pair}: {data}")
@@ -238,7 +241,10 @@ def check_and_send_daily_bias() -> None:
 # Main checks
 # ---------------------------------------------------------------------
 def check_all_pairs() -> None:
-    check_and_send_daily_bias()  # only actually sends once per calendar day
+    try:
+        check_and_send_daily_bias()  # only actually sends once per calendar day
+    except Exception as e:
+        print(f"[ERROR] Daily bias check failed (other alerts continue normally): {e}")
 
     htf_state = refresh_htf_zones_if_needed(load_htf_zones())
 
