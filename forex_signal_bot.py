@@ -34,6 +34,7 @@ from datetime import datetime, timezone
 from smc_detection import check_for_signal, find_order_blocks, check_price_in_zones, OrderBlock
 from candle_patterns import check_candle_patterns
 from economic_calendar import check_news_alerts
+from daily_bias import determine_daily_bias, format_bias_message
 
 # ---------------------------------------------------------------------
 # State files (persisted between runs, important for GitHub Actions
@@ -43,6 +44,7 @@ ALERTED_FILE = os.path.join(os.path.dirname(__file__), "alerted.json")
 CANDLE_ALERTED_FILE = os.path.join(os.path.dirname(__file__), "candle_alerted.json")
 ZONE_ALERTED_FILE = os.path.join(os.path.dirname(__file__), "zone_alerted.json")
 HTF_ZONES_FILE = os.path.join(os.path.dirname(__file__), "htf_zones.json")
+DAILY_BIAS_FILE = os.path.join(os.path.dirname(__file__), "daily_bias_sent.json")
 
 # ---------------------------------------------------------------------
 # Config — fill these in, or set as environment variables
@@ -64,6 +66,9 @@ HTF_CANDLE_COUNT = 100
 # calls so a run with many fetches (main pairs + HTF refresh) doesn't
 # fire them all in the same second and trip the per-minute limit.
 RATE_LIMIT_DELAY_SECONDS = 8
+
+DAILY_BIAS_INTERVAL = "1day"    # candle timeframe used to determine bias
+DAILY_BIAS_CANDLE_COUNT = 60
 
 # Detection tuning (see smc_detection.py for what these mean)
 SWING_LOOKBACK = 3
@@ -196,9 +201,45 @@ def alert(message: str) -> None:
 
 
 # ---------------------------------------------------------------------
+# Daily bias / sentiment (sent once per calendar day, not every run)
+# ---------------------------------------------------------------------
+def check_and_send_daily_bias() -> None:
+    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    last_sent_date = None
+    if os.path.exists(DAILY_BIAS_FILE):
+        with open(DAILY_BIAS_FILE, "r") as f:
+            last_sent_date = json.load(f).get("last_sent_date")
+
+    if last_sent_date == today_str:
+        return  # already sent today's bias
+
+    print("[INFO] Sending daily bias for all pairs...")
+    messages = []
+    for pair in PAIRS:
+        try:
+            candles = fetch_candles(pair, DAILY_BIAS_INTERVAL, DAILY_BIAS_CANDLE_COUNT)
+        except Exception as e:
+            print(f"[ERROR] Fetching daily candles for {pair}: {e}")
+            continue
+
+        result = determine_daily_bias(pair, candles)
+        if result:
+            messages.append(format_bias_message(result))
+
+    if messages:
+        alert("[DAILY BIAS]\n" + "\n".join(messages))
+
+    with open(DAILY_BIAS_FILE, "w") as f:
+        json.dump({"last_sent_date": today_str}, f)
+
+
+# ---------------------------------------------------------------------
 # Main checks
 # ---------------------------------------------------------------------
 def check_all_pairs() -> None:
+    check_and_send_daily_bias()  # only actually sends once per calendar day
+
     htf_state = refresh_htf_zones_if_needed(load_htf_zones())
 
     for pair in PAIRS:
