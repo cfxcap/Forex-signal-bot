@@ -1,9 +1,14 @@
 """
 Forex Signal Bot — end-to-end runner
 -------------------------------------
-Polls Twelve Data for candle data on your chosen pairs, runs the SMC
-detection logic (BOS + FVG/order block pullback), and sends a Telegram
-message when a signal fires.
+Polls Twelve Data for candle data on your chosen pairs and checks for
+FOUR kinds of alerts, each sent to Telegram when triggered:
+
+1. STRUCTURE SIGNAL — BOS + pullback into FVG/order block (15min)
+2. CANDLE PATTERN   — pin bar / engulfing reversal (15min, simpler/faster)
+3. HTF ZONE TOUCH   — price returning to a 2hr or 4hr supply/demand zone
+4. ECONOMIC NEWS    — High/Medium impact news for relevant currencies,
+                       15min before release and at release
 
 SETUP
 -----
@@ -17,21 +22,27 @@ SETUP
 6. Run: python3 forex_signal_bot.py
 
 This polls on a timer. For production you'd want to align polls to
-candle close times rather than a fixed interval, and add persistent
-state so you don't re-alert on the same signal every loop.
+candle close times rather than a fixed interval.
 """
 
 import os
 import json
 import time
 import requests
-from datetime import datetime
+from datetime import datetime, timezone
 
-from smc_detection import check_for_signal
+from smc_detection import check_for_signal, find_order_blocks, check_price_in_zones, OrderBlock
+from candle_patterns import check_candle_patterns
+from economic_calendar import check_news_alerts
 
-# Where alerted-signal history is persisted between runs (important for
-# GitHub Actions, where each run is a fresh process with no memory).
+# ---------------------------------------------------------------------
+# State files (persisted between runs, important for GitHub Actions
+# where each run is a fresh process with no memory)
+# ---------------------------------------------------------------------
 ALERTED_FILE = os.path.join(os.path.dirname(__file__), "alerted.json")
+CANDLE_ALERTED_FILE = os.path.join(os.path.dirname(__file__), "candle_alerted.json")
+ZONE_ALERTED_FILE = os.path.join(os.path.dirname(__file__), "zone_alerted.json")
+HTF_ZONES_FILE = os.path.join(os.path.dirname(__file__), "htf_zones.json")
 
 # ---------------------------------------------------------------------
 # Config — fill these in, or set as environment variables
@@ -45,26 +56,35 @@ INTERVAL = "15min"       # Twelve Data format: 1min,5min,15min,1h,4h,1day...
 CANDLE_COUNT = 100       # how many candles to pull per check
 POLL_SECONDS = 900       # how often to check (15 min), aligned with candle close.
 
+HTF_TIMEFRAMES = ["2h", "4h"]     # "higher timeframe" zones to watch
+HTF_REFRESH_HOURS = 2            # only re-fetch HTF candles this often (rate-limit friendly)
+HTF_CANDLE_COUNT = 100
+
 # Detection tuning (see smc_detection.py for what these mean)
 SWING_LOOKBACK = 3
 FVG_MIN_GAP_PCT = 0.0005
 OB_IMPULSE_PCT = 0.003
+HTF_OB_IMPULSE_PCT = 0.004   # slightly stricter on higher timeframes
 
-# Prevents duplicate alerts for the same BOS/zone across runs.
-# Persisted to disk so it survives between separate GitHub Actions runs.
-def load_alerted() -> set:
-    if not os.path.exists(ALERTED_FILE):
+
+# ---------------------------------------------------------------------
+# Generic JSON-set persistence helpers
+# ---------------------------------------------------------------------
+def load_set(path: str) -> set:
+    if not os.path.exists(path):
         return set()
-    with open(ALERTED_FILE, "r") as f:
+    with open(path, "r") as f:
         return set(tuple(item) for item in json.load(f))
 
 
-def save_alerted(alerted: set) -> None:
-    with open(ALERTED_FILE, "w") as f:
-        json.dump([list(item) for item in alerted], f)
+def save_set(path: str, data: set) -> None:
+    with open(path, "w") as f:
+        json.dump([list(item) for item in data], f)
 
 
-_already_alerted = load_alerted()
+_already_alerted = load_set(ALERTED_FILE)          # structure signals
+_candle_alerted = load_set(CANDLE_ALERTED_FILE)    # candle patterns
+_zone_alerted = load_set(ZONE_ALERTED_FILE)         # HTF zone touches
 
 
 # ---------------------------------------------------------------------
@@ -73,7 +93,7 @@ _already_alerted = load_alerted()
 def fetch_candles(pair: str, interval: str, count: int) -> list:
     """
     Pulls OHLC candles from Twelve Data's time_series endpoint.
-    Returns oldest-first list of dicts matching smc_detection's format.
+    Returns oldest-first list of dicts.
     """
     url = "https://api.twelvedata.com/time_series"
     params = {
@@ -88,9 +108,8 @@ def fetch_candles(pair: str, interval: str, count: int) -> list:
     if "values" not in data:
         raise RuntimeError(f"Twelve Data error for {pair}: {data}")
 
-    # Twelve Data returns newest-first; reverse to oldest-first
-    values = list(reversed(data["values"]))
-    candles = [
+    values = list(reversed(data["values"]))  # oldest-first
+    return [
         {
             "time": v["datetime"],
             "open": float(v["open"]),
@@ -100,7 +119,55 @@ def fetch_candles(pair: str, interval: str, count: int) -> list:
         }
         for v in values
     ]
-    return candles
+
+
+# ---------------------------------------------------------------------
+# Higher timeframe zone caching
+# ---------------------------------------------------------------------
+def load_htf_zones() -> dict:
+    if not os.path.exists(HTF_ZONES_FILE):
+        return {"last_refreshed": None, "zones": {}}
+    with open(HTF_ZONES_FILE, "r") as f:
+        return json.load(f)
+
+
+def save_htf_zones(state: dict) -> None:
+    with open(HTF_ZONES_FILE, "w") as f:
+        json.dump(state, f)
+
+
+def refresh_htf_zones_if_needed(htf_state: dict) -> dict:
+    """
+    Re-fetches 2h/4h candles and recomputes order block zones, but only
+    if HTF_REFRESH_HOURS have passed since the last refresh. This keeps
+    API usage well within Twelve Data's free daily limit.
+    """
+    last_refreshed = htf_state.get("last_refreshed")
+    needs_refresh = True
+    if last_refreshed:
+        elapsed_hours = (datetime.now(timezone.utc) - datetime.fromisoformat(last_refreshed)).total_seconds() / 3600
+        needs_refresh = elapsed_hours >= HTF_REFRESH_HOURS
+
+    if not needs_refresh:
+        return htf_state
+
+    print("[INFO] Refreshing higher-timeframe zones...")
+    zones = {}
+    for pair in PAIRS:
+        zones[pair] = {}
+        for tf in HTF_TIMEFRAMES:
+            try:
+                candles = fetch_candles(pair, tf, HTF_CANDLE_COUNT)
+                obs = find_order_blocks(candles, impulse_move_pct=HTF_OB_IMPULSE_PCT)
+                zones[pair][tf] = [
+                    {"index": ob.index, "top": ob.top, "bottom": ob.bottom, "direction": ob.direction}
+                    for ob in obs
+                ]
+            except Exception as e:
+                print(f"[ERROR] Fetching HTF {tf} candles for {pair}: {e}")
+                zones[pair][tf] = htf_state.get("zones", {}).get(pair, {}).get(tf, [])
+
+    return {"last_refreshed": datetime.now(timezone.utc).isoformat(), "zones": zones}
 
 
 # ---------------------------------------------------------------------
@@ -114,10 +181,19 @@ def send_telegram_alert(message: str) -> None:
         print(f"[WARN] Telegram send failed: {resp.text}")
 
 
+def alert(message: str) -> None:
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+    full_message = f"[{timestamp}] {message}"
+    print(full_message)
+    send_telegram_alert(full_message)
+
+
 # ---------------------------------------------------------------------
-# Main loop
+# Main checks
 # ---------------------------------------------------------------------
 def check_all_pairs() -> None:
+    htf_state = refresh_htf_zones_if_needed(load_htf_zones())
+
     for pair in PAIRS:
         try:
             candles = fetch_candles(pair, INTERVAL, CANDLE_COUNT)
@@ -125,29 +201,52 @@ def check_all_pairs() -> None:
             print(f"[ERROR] Fetching {pair}: {e}")
             continue
 
+        latest_price = candles[-1]["close"]
+
+        # 1. Structure signal (BOS + FVG/order block pullback)
         signal = check_for_signal(
-            pair,
-            candles,
+            pair, candles,
             swing_lookback=SWING_LOOKBACK,
             fvg_min_gap_pct=FVG_MIN_GAP_PCT,
             ob_impulse_pct=OB_IMPULSE_PCT,
         )
+        if signal:
+            key = (signal.pair, signal.bos_index, signal.zone_type, round(signal.zone_top, 5))
+            if key not in _already_alerted:
+                _already_alerted.add(key)
+                alert(f"[STRUCTURE] {signal.message}")
 
-        if signal is None:
-            continue
+        # 2. Candle pattern (pin bar / engulfing)
+        candle_signal = check_candle_patterns(pair, candles)
+        if candle_signal:
+            candle_time = candles[-1]["time"]
+            key = (pair, candle_signal.pattern, candle_signal.direction, candle_time)
+            if key not in _candle_alerted:
+                _candle_alerted.add(key)
+                alert(f"[CANDLE] {candle_signal.message}")
 
-        # De-dupe: only alert once per (pair, bos_index, zone_type)
-        alert_key = (signal.pair, signal.bos_index, signal.zone_type, round(signal.zone_top, 5))
-        if alert_key in _already_alerted:
-            continue
+        # 3. Higher timeframe zone touch
+        for tf in HTF_TIMEFRAMES:
+            zone_dicts = htf_state["zones"].get(pair, {}).get(tf, [])
+            obs = [OrderBlock(**z) for z in zone_dicts]
+            hit = check_price_in_zones(latest_price, obs)
+            if hit:
+                key = (pair, tf, hit.direction, round(hit.top, 5), round(hit.bottom, 5))
+                if key not in _zone_alerted:
+                    _zone_alerted.add(key)
+                    alert(
+                        f"[HTF ZONE] {pair}: price at {latest_price:.5f} entered a {tf} "
+                        f"{hit.direction} zone ({hit.bottom:.5f}-{hit.top:.5f})"
+                    )
 
-        _already_alerted.add(alert_key)
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
-        full_message = f"[{timestamp}] {signal.message}"
-        print(full_message)
-        send_telegram_alert(full_message)
+    # 4. Economic news (checked once per run, not per pair)
+    for news_message in check_news_alerts(PAIRS):
+        alert(news_message)
 
-    save_alerted(_already_alerted)
+    save_set(ALERTED_FILE, _already_alerted)
+    save_set(CANDLE_ALERTED_FILE, _candle_alerted)
+    save_set(ZONE_ALERTED_FILE, _zone_alerted)
+    save_htf_zones(htf_state)
 
 
 def run_forever() -> None:
@@ -167,8 +266,6 @@ if __name__ == "__main__":
         print("    export TELEGRAM_BOT_TOKEN=...")
         print("    export TELEGRAM_CHAT_ID=...")
     elif os.environ.get("LOOP_MODE") == "1":
-        # Local continuous testing: LOOP_MODE=1 python3 forex_signal_bot.py
         run_forever()
     else:
-        # Default: single run — this is what GitHub Actions triggers on a schedule.
         check_all_pairs()
