@@ -63,9 +63,10 @@ HTF_REFRESH_HOURS = 2            # only re-fetch HTF candles this often (rate-li
 HTF_CANDLE_COUNT = 100
 
 # Twelve Data free tier allows 8 requests/minute. This delay spaces out
-# calls so a run with many fetches (main pairs + HTF refresh) doesn't
-# fire them all in the same second and trip the per-minute limit.
-RATE_LIMIT_DELAY_SECONDS = 8
+# calls so a run with many fetches (main pairs + HTF refresh + daily bias)
+# doesn't trip the per-minute limit. Set comfortably below the 8/min cap
+# rather than right at the edge, since network latency can tip it over.
+RATE_LIMIT_DELAY_SECONDS = 10
 
 DAILY_BIAS_INTERVAL = "1day"    # candle timeframe used to determine bias
 DAILY_BIAS_CANDLE_COUNT = 60
