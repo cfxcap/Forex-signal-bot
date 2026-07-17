@@ -93,7 +93,8 @@ def check_news_alerts(pairs: list) -> list:
         if event.get("country") in currencies and event.get("impact") in RELEVANT_IMPACTS:
             try:
                 et = datetime.fromisoformat(event["date"].replace("Z", "+00:00"))
-                if et >= now:
+                mins_until = (et - now).total_seconds() / 60
+                if mins_until >= RELEASE_WINDOW_MINUTES[0]:
                     upcoming_relevant.append((et, event["country"], event["impact"], event["title"]))
             except (ValueError, KeyError):
                 continue
