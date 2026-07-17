@@ -31,8 +31,8 @@ RELEVANT_IMPACTS = {"High", "Medium"}
 
 # Window sizes (minutes). A run happening anywhere inside these windows
 # will trigger that stage's alert once.
-BEFORE_WINDOW_MINUTES = (10, 20)   # catches "~15 min before" even with schedule drift
-RELEASE_WINDOW_MINUTES = (-7, 7)   # catches "at release" within +/-7 min
+BEFORE_WINDOW_MINUTES = (5, 40)     # catches "before" alerts even with schedule drift
+RELEASE_WINDOW_MINUTES = (-40, 10)  # catches "release" alerts even if the next run is late
 
 
 def currencies_from_pairs(pairs: list) -> set:
@@ -84,6 +84,27 @@ def check_news_alerts(pairs: list) -> list:
         return messages
 
     now = datetime.now(timezone.utc)
+
+    # Diagnostic: show the next few relevant upcoming events every run,
+    # so you can confirm the bot is actually seeing real events (even on
+    # runs where nothing falls inside an alert window yet).
+    upcoming_relevant = []
+    for event in events:
+        if event.get("country") in currencies and event.get("impact") in RELEVANT_IMPACTS:
+            try:
+                et = datetime.fromisoformat(event["date"].replace("Z", "+00:00"))
+                if et >= now:
+                    upcoming_relevant.append((et, event["country"], event["impact"], event["title"]))
+            except (ValueError, KeyError):
+                continue
+    upcoming_relevant.sort(key=lambda x: x[0])
+    if upcoming_relevant:
+        print(f"[INFO] Next {min(3, len(upcoming_relevant))} relevant news event(s):")
+        for et, cur, imp, title in upcoming_relevant[:3]:
+            mins_away = (et - now).total_seconds() / 60
+            print(f"       {cur} {imp} — {title} in {mins_away:.0f} min ({et.isoformat()})")
+    else:
+        print("[INFO] No upcoming High/Medium news events found for your currencies this week.")
 
     for event in events:
         currency = event.get("country")
